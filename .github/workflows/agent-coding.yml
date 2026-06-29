@@ -1,0 +1,101 @@
+name: Coding Agent
+
+# Triggers Cursor's Coding Cloud Agent via API when a Linear issue arrives
+# in this repo (mirrored as a GitHub issue by Linear's GitHub integration).
+# Replaces the manual cursor.com/agents Automation so the trigger config
+# lives in code and propagates automatically via gsd new.
+
+on:
+  issues:
+    types: [opened]
+
+# Concurrency-guard against the rare case where the same issue gets edited
+# in a way that re-fires the trigger before the previous run claimed work.
+concurrency:
+  group: coding-agent-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  # Gate the agent on CURSOR_API_KEY being present. Secrets can't be used in
+  # job-level `if:`, so we surface presence as an output here and skip cleanly
+  # (neutral, not failed) on repos that haven't set the key.
+  guard:
+    name: Check Cursor API key
+    runs-on: ubuntu-latest
+    outputs:
+      has_key: ${{ steps.check.outputs.has_key }}
+    steps:
+      - id: check
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          if [ -n "$CURSOR_API_KEY" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Cursor agent skipped::CURSOR_API_KEY is not set on this repo — skipping. Set it with: gh secret set CURSOR_API_KEY --repo <owner>/<repo>"
+          fi
+
+  trigger:
+    name: Launch Cursor Coding Agent
+    needs: guard
+    if: >
+      needs.guard.outputs.has_key == 'true' &&
+      contains(github.event.issue.labels.*.name, 'agent-task') &&
+      startsWith(github.event.issue.title, '[CODING]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Render prompt and call Cursor API
+        id: trigger
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          REPO: ${{ github.repository }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        run: |
+          set -euo pipefail
+          PROMPT=$(jq -Rs \
+            --arg repo "$REPO" \
+            --arg t "$ISSUE_TITLE" \
+            --arg b "${ISSUE_BODY:-}" \
+            --arg u "$ISSUE_URL" \
+            '
+              gsub("\\{\\{repo\\}\\}"; $repo)
+              | gsub("\\{\\{issue.title\\}\\}"; $t)
+              | gsub("\\{\\{issue.body\\}\\}"; $b)
+              | gsub("\\{\\{issue.url\\}\\}"; $u)
+            ' .cursor/agent-prompts/coding.md)
+
+          PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            --arg repo "$REPO" \
+            '{
+              prompt: { text: $prompt },
+              source: { repository: ("github.com/" + $repo), ref: "staging" },
+              target: { autoCreatePr: true, openAsCursorGithubApp: true },
+              model: "composer-2.5"
+            }')
+
+          response=$(curl -sS -X POST "https://api.cursor.com/v0/agents" \
+            -H "Authorization: Bearer $CURSOR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          echo "$response" | jq .
+          AGENT_ID=$(echo "$response" | jq -er '.id')
+          echo "agent_id=$AGENT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Comment agent run link on issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_ID: ${{ steps.trigger.outputs.agent_id }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$REPO" \
+            --body "🤖 Cursor coding agent started: [\`$AGENT_ID\`](https://cursor.com/agents/$AGENT_ID) — agent will open a PR against \`staging\` when done."

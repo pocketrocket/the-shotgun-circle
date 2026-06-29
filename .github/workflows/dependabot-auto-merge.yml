@@ -16,8 +16,12 @@ jobs:
         uses: dependabot/fetch-metadata@v3
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Auto-merge minor, patch & github-actions
-        if: ${{ steps.meta.outputs.update-type == 'version-update:semver-minor' || steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.dependency-group == 'github-actions' }}
+      # Auto-merge low-risk updates: individual minor/patch, the minor-and-patch
+      # group (defined in dependabot.yml as minor+patch only), and the
+      # github-actions group. Majors and requirement-updates (update-type null,
+      # e.g. constraint loosening) are deliberately left for review.
+      - name: Auto-merge minor, patch & groups
+        if: ${{ steps.meta.outputs.update-type == 'version-update:semver-minor' || steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.dependency-group == 'minor-and-patch' || steps.meta.outputs.dependency-group == 'github-actions' }}
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}

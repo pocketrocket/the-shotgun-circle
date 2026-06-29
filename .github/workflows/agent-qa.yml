@@ -1,0 +1,145 @@
+name: QA Agent
+
+# Triggers Cursor's QA Cloud Agent via API when a PR is labeled needs-qa,
+# waits for the agent to finish, then posts the report as a PR comment
+# and updates labels. The workflow does the comment + label step (not
+# the agent) because Cursor's sandbox token lacks pull-requests:write.
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  # Gate the agent on CURSOR_API_KEY being present. Secrets can't be used in
+  # job-level `if:`, so we surface presence as an output here and skip cleanly
+  # (neutral, not failed) on repos that haven't set the key.
+  guard:
+    name: Check Cursor API key
+    runs-on: ubuntu-latest
+    outputs:
+      has_key: ${{ steps.check.outputs.has_key }}
+    steps:
+      - id: check
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          if [ -n "$CURSOR_API_KEY" ]; then
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Cursor agent skipped::CURSOR_API_KEY is not set on this repo — skipping. Set it with: gh secret set CURSOR_API_KEY --repo <owner>/<repo>"
+          fi
+
+  trigger:
+    name: Run QA Agent
+    needs: guard
+    if: needs.guard.outputs.has_key == 'true' && github.event.label.name == 'needs-qa'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trigger Cursor agent
+        id: trigger
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          REPO: ${{ github.repository }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          PROMPT=$(jq -Rs \
+            --arg repo "$REPO" \
+            --arg t "$PR_TITLE" \
+            --arg b "${PR_BODY:-}" \
+            --arg u "$PR_URL" \
+            --arg h "$PR_HEAD" \
+            --arg base "$PR_BASE" \
+            '
+              gsub("\\{\\{repo\\}\\}"; $repo)
+              | gsub("\\{\\{pr.title\\}\\}"; $t)
+              | gsub("\\{\\{pr.body\\}\\}"; $b)
+              | gsub("\\{\\{pr.url\\}\\}"; $u)
+              | gsub("\\{\\{pr.head_ref\\}\\}"; $h)
+              | gsub("\\{\\{pr.base_ref\\}\\}"; $base)
+            ' .cursor/agent-prompts/qa.md)
+
+          PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            --arg repo "$REPO" \
+            --arg ref "$PR_HEAD" \
+            '{
+              prompt: { text: $prompt },
+              source: { repository: ("github.com/" + $repo), ref: $ref },
+              target: { autoCreatePr: false, openAsCursorGithubApp: true },
+              model: "composer-2.5"
+            }')
+
+          response=$(curl -sS -X POST "https://api.cursor.com/v0/agents" \
+            -H "Authorization: Bearer $CURSOR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          echo "$response" | jq .
+          AGENT_ID=$(echo "$response" | jq -er '.id')
+          echo "agent_id=$AGENT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for agent to finish
+        id: wait
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          AGENT_ID: ${{ steps.trigger.outputs.agent_id }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            agent_status=$(curl -sS "https://api.cursor.com/v0/agents/$AGENT_ID" \
+              -H "Authorization: Bearer $CURSOR_API_KEY" | jq -r '.status')
+            echo "[$i/30] status: $agent_status"
+            if [[ "$agent_status" != "RUNNING" && "$agent_status" != "CREATING" ]]; then
+              echo "final_status=$agent_status" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "final_status=TIMEOUT" >> "$GITHUB_OUTPUT"
+
+      - name: Post agent report as PR comment + update labels
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          AGENT_ID: ${{ steps.trigger.outputs.agent_id }}
+          AGENT_STATUS: ${{ steps.wait.outputs.final_status }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          REPORT=$(curl -sS "https://api.cursor.com/v0/agents/$AGENT_ID/conversation" \
+            -H "Authorization: Bearer $CURSOR_API_KEY" \
+            | jq -r '[.messages[] | select(.type == "assistant_message") | .text] | last')
+
+          {
+            echo "## QA report (Cursor QA agent — IaC)"
+            echo ""
+            echo "**Agent run:** [\`$AGENT_ID\`](https://cursor.com/agents/$AGENT_ID)"
+            echo "**Status:** \`$AGENT_STATUS\`"
+            echo ""
+            echo "$REPORT"
+          } > /tmp/qa-comment.md
+          gh pr comment "$PR" --repo "$REPO" --body-file /tmp/qa-comment.md
+
+          # Outcome detection: if the report indicates success, flip labels
+          if [[ "$AGENT_STATUS" == "FINISHED" ]] && \
+             echo "$REPORT" | grep -qiE "all (checks )?(✅|green|passed)"; then
+            gh pr edit "$PR" --repo "$REPO" --remove-label needs-qa --add-label qa-passed
+            echo "Labels: needs-qa → qa-passed"
+          else
+            gh pr edit "$PR" --repo "$REPO" --add-label needs-human || true
+            echo "Labels: added needs-human (status=$AGENT_STATUS, not all-green)"
+            exit 1
+          fi

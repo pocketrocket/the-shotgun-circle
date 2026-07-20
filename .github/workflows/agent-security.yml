@@ -162,6 +162,7 @@ jobs:
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           PROMPT=$(jq -Rs \
@@ -179,9 +180,10 @@ jobs:
           PAYLOAD=$(jq -n \
             --arg prompt "$PROMPT" \
             --arg repo "$REPO" \
+            --arg ref "$DEFAULT_BRANCH" \
             '{
               prompt: { text: $prompt },
-              source: { repository: ("github.com/" + $repo), ref: "main" },
+              source: { repository: ("github.com/" + $repo), ref: $ref },
               target: { autoCreatePr: true, openAsCursorGithubApp: true },
               model: "composer-2.5"
             }')

@@ -2,15 +2,18 @@ name: Security Agent
 
 # Triggers Cursor's Security Cloud Agent via API in two modes:
 #   1. PR mode — Dependabot/dep-labeled PR → workflow waits + posts report
-#   2. Cron mode — weekly Mondays 06:00 UTC, sandbox creates fix PRs/issues
+#   2. Cron mode — weekly audit, sandbox creates fix PRs/issues
 # (Cursor sandbox can create new PRs/issues but cannot comment on existing
 #  PRs, so PR-mode requires the workflow to post the report itself.)
+#
+# The weekly run is NOT self-scheduled here — that would fire on every managed
+# repo at the same instant and trip Cursor's concurrent-agent limit. Instead
+# the template's weekly-security-dispatch.yml triggers this via workflow_dispatch,
+# staggered and throttled under the limit. (cron-mode still runs on dispatch.)
 
 on:
   pull_request:
     types: [opened, synchronize, labeled]
-  schedule:
-    - cron: "0 6 * * 1"
   workflow_dispatch:
 
 jobs:

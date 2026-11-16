@@ -6,7 +6,7 @@
 - **`.env.example`** must be checked in with placeholder values and comments.
 - **All env vars** accessed via `process.env.X` and validated with Zod at startup.
 - **Production secrets** live ONLY in Vercel environment settings (not in code, not in CI).
-- **gitleaks** runs in CI and pre-commit (configured in `.github/workflows/security.yml`).
+- **gitleaks** runs in CI and pre-commit (configured in `.github/workflows/security.yml`). Placeholder tokens in docs are allowlisted via `.gitleaks.toml`.
 
 ## Input Validation
 

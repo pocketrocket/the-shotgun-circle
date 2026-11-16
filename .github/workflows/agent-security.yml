@@ -20,8 +20,22 @@ jobs:
   # Gate the agent on CURSOR_API_KEY being present. Secrets can't be used in
   # job-level `if:`, so we surface presence as an output here and skip cleanly
   # (neutral, not failed) on repos that haven't set the key.
+  #
+  # The guard carries the same event filter as the job(s) it gates, so it only
+  # runs when an agent would actually start. A job that runs bills at least one
+  # full Actions minute, even for this 2-second check; a skipped job bills
+  # nothing. Without the filter the guard alone cost one minute per PR push,
+  # label or CI completion in every managed repo. Keep both filters in sync.
   guard:
     name: Check Cursor API key
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' || (
+        github.event_name == 'pull_request' && (
+          github.event.pull_request.user.login == 'dependabot[bot]' ||
+          contains(github.event.pull_request.labels.*.name, 'dependencies')
+        )
+      )
     runs-on: ubuntu-latest
     outputs:
       has_key: ${{ steps.check.outputs.has_key }}
